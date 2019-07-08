@@ -81,5 +81,32 @@ _【表格来自于 《Node.js 开发指南》 — byvoid】_
 
 `setTimeout`、`setInterval`、`promise` 与浏览器中的 API 一致，在此不再赘述。
 
-`process.nextTick` 的功能
+`process.nextTick` 的功能是为事件循环设置一项任务， Node 会在下一轮事件循环时调用 callback。
 
+为什么不能在当前循环执行完这项任务，而要交给下次事件循环呢？我们知道，一个 Node 进程只有一个主线程，在任何时刻都只有一个事件在执行。如果这个事件占用大量 CPU 时间，事件循环中的下一个事件就要等待很久。使用 process.nextTick() 可以把复杂的工作拆散，变成一个个较小的事件。例如：
+
+```javascript
+function doSomething(args, callback) {
+  somethingComplicated(args);
+  process.nextTick(callback);
+}
+doSomething(function onEnd() {
+  compute();
+});
+```
+
+假设 `compute()` 和 `somethingComplicated()` 是两个较为耗时的函数，调用 `doSomething()` 时会先执行 `somethingComplicated()`，如果不使用 `process.nextTick`，会立即调用回调函数，在 `onEnd()` 中会执行 `compute()`，从而会占用较长 CPU 时间，阻塞其他事件的处理。而通过 `process.nextTick` 会把上面耗时的操作拆分至两次事件循环，减少了每个事件的执行时间，避免阻塞其他事件。
+
+另外，需要注意的是，虽然定时器也能将任务拆分至下一次事件循环处理，但并不建议用其代替 `process.nextTick(fn)`，因为定时器的处理涉及到最小堆操作，时间复杂度为 `O(lg(n))`，而 `process.nextTick` 只是把回调函数放入队列之中，时间复杂度为 `O(1)`，更加高效。
+
+`setImmediate()` 和 `process.nextTick()` 类似，也是将回调函数延迟执行。不过 `process.nextTick` 会先于 `setImmediate` 执行。因为 `process.nextTick` 属于 microtask，会在事件循环之初就执行；而 `setImmediate` 在事件循环的 check 阶段才会执行。这部分将在下一小节详述。
+
+## 事件循环的执行机制
+
+Node 中的事件循环是在 libuv 中实现的，libuv 在 Node 中的地位如下图：
+
+![image](https://user-images.githubusercontent.com/9818716/60803034-d9adbe80-a1ac-11e9-8d8f-d5a00625d958.png)
+
+_【图片来自《深入浅出 Node.js》 — 朴灵】_
+
+Node 不是一个从零开始开发的 JavaScript 运行时，它是“站在巨人肩膀上”进行一系列拼凑和封装得到的结果。V8（Chrome V8）是 Node 的 JavaScript 引擎，由谷歌开源，以 C++ 编写，具有高性能和跨平台的特性，同时也用于 Chrome 浏览器。libuv 是专注于异步 I/O 的跨平台类库，实际上它主要就是为 Node 开发的。基于不同平台的异步机制，如 epoll / kqueue / IOCP / event ports，libuv 实现了跨平台的事件循环。作为一个在操作系统之上的中间层，libuv 使开发者不用自己管理线程就能轻松的实现异步。
