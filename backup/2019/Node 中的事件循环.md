@@ -110,3 +110,30 @@ Node 中的事件循环是在 libuv 中实现的，libuv 在 Node 中的地位�
 _【图片来自《深入浅出 Node.js》 — 朴灵】_
 
 Node 不是一个从零开始开发的 JavaScript 运行时，它是“站在巨人肩膀上”进行一系列拼凑和封装得到的结果。V8（Chrome V8）是 Node 的 JavaScript 引擎，由谷歌开源，以 C++ 编写，具有高性能和跨平台的特性，同时也用于 Chrome 浏览器。libuv 是专注于异步 I/O 的跨平台类库，实际上它主要就是为 Node 开发的。基于不同平台的异步机制，如 epoll / kqueue / IOCP / event ports，libuv 实现了跨平台的事件循环。作为一个在操作系统之上的中间层，libuv 使开发者不用自己管理线程就能轻松的实现异步。
+
+下图是官方文档中给出的 libuv 结构图：
+
+![image](https://user-images.githubusercontent.com/9818716/60973805-829a1c00-a35b-11e9-84bf-66d546db2846.png)
+
+可以看出，除了事件循环外，libuv 还提供了计时器、网络操作、文件操作、子进程等功能。
+
+在 Node 中，就是直接使用 libuv 中的事件循环：
+
+https://github.com/nodejs/node/blob/master/src/node.cc#L1059
+
+![image](https://user-images.githubusercontent.com/9818716/60974007-dd337800-a35b-11e9-9444-8d1f39a7b493.png)
+
+下面是 libuv 中事件循环的详细流程：
+
+![image](https://user-images.githubusercontent.com/9818716/60974016-e15f9580-a35b-11e9-86de-80883b828616.png)
+
+如上图所示，libuv 中的事件循环主要有 7 个阶段，它们按照执行顺序依次为：
+
+- timers 阶段：这个阶段执行 `setTimeout` 和 `setInterval` 预定的回调函数；
+- pending callbacks 阶段：这个阶段会执行除了 close 事件回调、被 timers 设定的回调、`setImmediate` 设定的回调之外的回调函数；
+- idle、prepare 阶段：供 node 内部使用；
+- poll 阶段：获取新的 I/O 事件，在某些条件下 node 将阻塞在这里；
+- check 阶段：执行 `setImmediate` 设定的回调函数；
+- close callbacks 阶段：执行 `socket.on('close', ...)` 之类的回调函数
+
+除了 libuv 中的七个阶段外，Node 中还有一个特殊的阶段，它一般被称为 microtask，它由 V8 实现，被 Node 调用。包括了 `process.nextTick`、`Promise.resolve` 等微任务。值得注意的是，在浏览器环境下，我们常说事件循环中包括宏任务（macrotask 或 task）和微任务（microtask），这两个概念是在 HTML 规范中制定，由浏览器厂商各自实现的。而在 Node 环境中，是没有宏任务这个概念的，至于前面所说的微任务，则是由 V8 实现，被 Node 调用的；虽然名字相同，但浏览器中的微任务和 Node 中的微任务实际上不是一个东西，当然，不排除它们间有相互借鉴的成分。
