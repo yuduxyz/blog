@@ -136,4 +136,508 @@ https://github.com/nodejs/node/blob/master/src/node.cc#L1059
 - check 阶段：执行 `setImmediate` 设定的回调函数；
 - close callbacks 阶段：执行 `socket.on('close', ...)` 之类的回调函数
 
-除了 libuv 中的七个阶段外，Node 中还有一个特殊的阶段，它一般被称为 microtask，它由 V8 实现，被 Node 调用。包括了 `process.nextTick`、`Promise.resolve` 等微任务。值得注意的是，在浏览器环境下，我们常说事件循环中包括宏任务（macrotask 或 task）和微任务（microtask），这两个概念是在 HTML 规范中制定，由浏览器厂商各自实现的。而在 Node 环境中，是没有宏任务这个概念的，至于前面所说的微任务，则是由 V8 实现，被 Node 调用的；虽然名字相同，但浏览器中的微任务和 Node 中的微任务实际上不是一个东西，当然，不排除它们间有相互借鉴的成分。
+除了 libuv 中的七个阶段外，Node 中还有一个特殊的阶段，它一般被称为 microtask，它由 V8 实现，被 Node 调用。包括了 `process.nextTick`、`Promise.resolve` 等微任务，它们会在 libuv 的七个阶段之前执行，而且 `process.nextTick` 的优先级高于 `Promise.resolve`。值得注意的是，在浏览器环境下，我们常说事件循环中包括宏任务（macrotask 或 task）和微任务（microtask），这两个概念是在 HTML 规范中制定，由浏览器厂商各自实现的。而在 Node 环境中，是没有宏任务这个概念的，至于前面所说的微任务，则是由 V8 实现，被 Node 调用的；虽然名字相同，但浏览器中的微任务和 Node 中的微任务实际上不是一个东西，当然，不排除它们间有相互借鉴的成分。
+
+让我们通过 libuv 中控制事件循环的核心代码，近距离观察这几个阶段。在 libuv v1.x 版本中，事件循环的核心函数 `uv_run()` 分别在 `src/unix/core.c` 和 `src/win/core.c` 中：
+
+https://github.com/libuv/libuv/blob/v1.x/src/unix/core.c#L348
+
+```C
+int uv_run(uv_loop_t* loop, uv_run_mode mode) {
+  int timeout;
+  int r;
+  int ran_pending;
+
+	// 判断事件循环继续还是启动新一轮循环
+  r = uv__loop_alive(loop);
+  if (!r)
+    uv__update_time(loop);
+
+  while (r != 0 && loop->stop_flag == 0) {
+    uv__update_time(loop);
+    uv__run_timers(loop);  // timers 阶段
+    ran_pending = uv__run_pending(loop);  // pending 阶段
+    uv__run_idle(loop);  // idle 阶段
+    uv__run_prepare(loop);  // prepare 阶段
+
+    timeout = 0;
+    if ((mode == UV_RUN_ONCE && !ran_pending) || mode == UV_RUN_DEFAULT)
+      timeout = uv_backend_timeout(loop);
+
+    uv__io_poll(loop, timeout);  // poll 阶段
+    uv__run_check(loop);  // check 阶段
+    uv__run_closing_handles(loop);  // close 阶段
+
+    if (mode == UV_RUN_ONCE) {
+      /* UV_RUN_ONCE implies forward progress: at least one callback must have
+       * been invoked when it returns. uv__io_poll() can return without doing
+       * I/O (meaning: no callbacks) when its timeout expires - which means we
+       * have pending timers that satisfy the forward progress constraint.
+       *
+       * UV_RUN_NOWAIT makes no guarantees about progress so it's omitted from
+       * the check.
+       */
+      uv__update_time(loop);
+      uv__run_timers(loop);
+    }
+
+    r = uv__loop_alive(loop);
+    if (mode == UV_RUN_ONCE || mode == UV_RUN_NOWAIT)
+      break;
+  }
+
+  /* The if statement lets gcc compile it to a conditional store. Avoids
+   * dirtying a cache line.
+   */
+  if (loop->stop_flag != 0)
+    loop->stop_flag = 0;
+
+  return r;
+}
+```
+
+从上述代码中可以清楚的看到 timers、pending、idle、prepare、poll、check、close 这七个阶段的调用。下面，让我们详细看看这几个阶段。
+
+### timers 阶段
+
+https://github.com/libuv/libuv/blob/v1.x/src/timer.c#L159
+
+```C
+void uv__run_timers(uv_loop_t* loop) {
+  struct heap_node* heap_node;
+  uv_timer_t* handle;
+
+  for (;;) {
+    heap_node = heap_min(timer_heap(loop));  // 最小堆
+    if (heap_node == NULL)
+      break;
+
+    handle = container_of(heap_node, uv_timer_t, heap_node);
+    if (handle->timeout > loop->time)  // 如果遇到第一个还未到触发时间的事件回调，退出循环
+      break;
+
+    uv_timer_stop(handle);
+    uv_timer_again(handle);
+    handle->timer_cb(handle);
+  }
+}
+```
+
+可以看出，timers 阶段使用的数据结构是最小堆。这个阶段会在事件循环的一个 tick 中不断循环，把超时时间和当前的循环时间（`loop -> time`）进行比较，执行所有到期回调；如果遇到第一个还未到期的回调，则退出循环，不再执行 timers queue 后面的回调。
+
+这里为什么用最小堆而不用队列？因为 timeout 回调需要按照超时时间的顺序来调用，而不是先进先出的队列逻辑。所以这里用了最小堆。
+
+### pending 阶段
+
+https://github.com/libuv/libuv/blob/v1.x/src/unix/core.c#L792
+
+```C
+static int uv__run_pending(uv_loop_t* loop) {
+  QUEUE* q;
+  QUEUE pq;
+  uv__io_t* w;
+
+  if (QUEUE_EMPTY(&loop->pending_queue))
+    return 0;
+
+  QUEUE_MOVE(&loop->pending_queue, &pq);
+
+  while (!QUEUE_EMPTY(&pq)) {
+    q = QUEUE_HEAD(&pq);
+    QUEUE_REMOVE(q);
+    QUEUE_INIT(q);
+    w = QUEUE_DATA(q, uv__io_t, pending_queue);
+    w->cb(loop, w, POLLOUT);
+  }
+
+  return 1;
+}
+```
+
+这里使用的是队列。一些应该在上轮循环 poll 阶段执行的回调，如果因为某些原因不能执行，就会被延迟到这一轮循环的 pending 阶段执行。也就是说，这个阶段执行的回调都是上一轮残留的。
+
+### idle、prepare、check 阶段
+
+这三个阶段都由同一个函数定义
+
+https://github.com/libuv/libuv/blob/v1.x/src/unix/loop-watcher.c#L48
+
+```C
+void uv__run_##name(uv_loop_t* loop) {                                      \
+  uv_##name##_t* h;                                                         \
+  QUEUE queue;                                                              \
+  QUEUE* q;                                                                 \
+  QUEUE_MOVE(&loop->name##_handles, &queue);                                \
+  while (!QUEUE_EMPTY(&queue)) {                                            \
+    q = QUEUE_HEAD(&queue);                                                 \
+    h = QUEUE_DATA(q, uv_##name##_t, queue);                                \
+    QUEUE_REMOVE(q);                                                        \
+    QUEUE_INSERT_TAIL(&loop->name##_handles, q);                            \
+    h->name##_cb(h);                                                        \
+  }                                                                         \
+}
+```
+
+这里用了宏以实现代码的复用，但同时也降低了可读性。这部分的逻辑和 pending 阶段很像，遍历队列，执行回调，直至队列为空。
+
+### poll 阶段
+
+https://github.com/libuv/libuv/blob/v1.x/src/unix/linux-core.c#L196
+
+poll 阶段较为复杂，一共有 400+ 行代码，这里只截取部分，完整逻辑请自行查看源码。
+
+```C
+void uv__io_poll(uv_loop_t* loop, int timeout) {
+	// ...
+	// 处理观察者队列
+  while (!QUEUE_EMPTY(&loop->watcher_queue)) {
+    // ...
+    if (w->events == 0)
+      op = EPOLL_CTL_ADD;  // 新增监听事件
+    else
+      op = EPOLL_CTL_MOD;  // 修改事件
+	
+	// ...
+  for (;;) {
+    /* See the comment for max_safe_timeout for an explanation of why
+     * this is necessary.  Executive summary: kernel bug workaround.
+     */
+		// 计算好 timeout 以防 uv_loop 一直阻塞
+    if (sizeof(int32_t) == sizeof(long) && timeout >= max_safe_timeout)
+      timeout = max_safe_timeout;
+
+    nfds = epoll_pwait(loop->backend_fd,
+                       events,
+                       ARRAY_SIZE(events),
+                       timeout,
+                       psigset);
+
+    /* Update loop->time unconditionally. It's tempting to skip the update when
+     * timeout == 0 (i.e. non-blocking poll) but there is no guarantee that the
+     * operating system didn't reschedule our process while in the syscall.
+     */
+    SAVE_ERRNO(uv__update_time(loop));
+
+    if (nfds == 0) {
+      assert(timeout != -1);
+
+      if (timeout == 0)
+        return;
+
+      /* We may have been inside the system call for longer than |timeout|
+       * milliseconds so we need to update the timestamp to avoid drift.
+       */
+      goto update_timeout;
+    }
+
+    if (nfds == -1) {
+      if (errno != EINTR)
+        abort();
+
+      if (timeout == -1)
+        continue;
+
+      if (timeout == 0)
+        return;
+
+      /* Interrupted by a signal. Update timeout and poll again. */
+      goto update_timeout;
+    }
+
+    have_signals = 0;
+    nevents = 0;
+
+    assert(loop->watchers != NULL);
+    loop->watchers[loop->nwatchers] = (void*) events;
+    loop->watchers[loop->nwatchers + 1] = (void*) (uintptr_t) nfds;
+    for (i = 0; i < nfds; i++) {
+      pe = events + i;
+      fd = pe->data.fd;
+
+      /* Skip invalidated events, see uv__platform_invalidate_fd */
+      if (fd == -1)
+        continue;
+
+      assert(fd >= 0);
+      assert((unsigned) fd < loop->nwatchers);
+
+      w = loop->watchers[fd];
+
+      if (w == NULL) {
+        epoll_ctl(loop->backend_fd, EPOLL_CTL_DEL, fd, pe);
+        continue;
+      }
+      pe->events &= w->pevents | POLLERR | POLLHUP;
+      if (pe->events == POLLERR || pe->events == POLLHUP)
+        pe->events |=
+          w->pevents & (POLLIN | POLLOUT | UV__POLLRDHUP | UV__POLLPRI);
+
+      if (pe->events != 0) {
+        /* Run signal watchers last.  This also affects child process watchers
+         * because those are implemented in terms of signal watchers.
+         */
+        if (w == &loop->signal_io_watcher)
+          have_signals = 1;
+        else
+          w->cb(loop, w, pe->events);
+
+        nevents++;
+      }
+    }
+		// ...
+}
+```
+
+poll 阶段的任务是阻塞以等待监听事件的来临，然后执行对应的回调。其中阻塞是有超时时间，在某些条件下超时时间会被置为 0。此时，就会进入下一阶段，而本 poll 阶段未执行的回调会在下一循环的 pending 阶段执行。
+
+### close 阶段
+
+https://github.com/libuv/libuv/blob/v1.x/src/unix/core.c#L291
+
+```C
+static void uv__run_closing_handles(uv_loop_t* loop) {
+  uv_handle_t* p;
+  uv_handle_t* q;
+
+  p = loop->closing_handles;
+  loop->closing_handles = NULL;
+
+  while (p) {
+    q = p->next_closing;
+    uv__finish_close(p);
+    p = q;
+  }
+}
+```
+
+close 阶段的逻辑非常简单，就是循环关闭所有的 closing handles，其中的回调被 `uv__finish_close` 调用。
+
+上面便是 libuv 关于事件循环七个阶段的简单源码解读。之前我们还提到，在 microtask 中，存在着 `process.nextTick` 和 `Promise.resolve` 等阶段。这部分已经超出了 libuv 的范围，我们可以在 node 源码中找到它们的调用路径。
+
+### process.nextTick
+
+https://github.com/nodejs/node/blob/master/lib/internal/process/task_queues.js#L109
+
+```C++
+const {
+  // For easy access to the nextTick state in the C++ land,
+  // and to avoid unnecessary calls into JS land.
+  tickInfo,
+  // Used to run V8's micro task queue.
+  runMicrotasks,
+  setTickCallback,
+  enqueueMicrotask
+} = internalBinding('task_queue');
+// ...
+// Should be in sync with RunNextTicksNative in node_task_queue.cc
+function runNextTicks() {
+  if (!hasTickScheduled() && !hasRejectionToWarn())
+    runMicrotasks();
+  if (!hasTickScheduled() && !hasRejectionToWarn())
+    return;
+
+  processTicksAndRejections();
+}
+// ...
+function nextTick(callback) {
+  if (typeof callback !== 'function')
+    throw new ERR_INVALID_CALLBACK(callback);
+
+  if (process._exiting)
+    return;
+
+  var args;
+  switch (arguments.length) {
+    case 1: break;
+    case 2: args = [arguments[1]]; break;
+    case 3: args = [arguments[1], arguments[2]]; break;
+    case 4: args = [arguments[1], arguments[2], arguments[3]]; break;
+    default:
+      args = new Array(arguments.length - 1);
+      for (var i = 1; i < arguments.length; i++)
+        args[i - 1] = arguments[i];
+  }
+
+  if (queue.isEmpty())
+    setHasTickScheduled(true);
+  queue.push(new TickObject(callback, args));
+}
+```
+
+可以看到，nextTick 就是向 queue 队列压入 callback，然后 `nextTick` 调用后得到的队列被 `runNextTick` 使用，触发 `runMicrotasks` 函数，这个函数通过 `internalBiding` 绑定至 `node_task_queue.cc` 中的同名函数。最终，会触发 V8 中的 microtask 队列处理。
+
+同理，promise 的相应调用路径可以从 https://github.com/nodejs/node/blob/master/lib/internal/process/promises.js 中追踪得到，篇幅有限，就不再赘述了。
+
+## 浏览器事件循环 vs Node 事件循环
+
+浏览器中的事件循环是 HTML 规范中制定的，由不同浏览器厂商自行实现；而 Node 中则由 libuv 库实现。因此，浏览器和 Node 中的事件循环在实现原理和执行流程上都存在差异。
+
+### 浏览器环境
+
+在浏览器中，JavaScript 执行为单线程（不考虑 web worker），所有代码均在主线程调用栈完成执行。当主线程任务清空后才会去轮循任务队列中的任务。
+
+异步任务分为 task（宏任务，也可以被称为 macrotask）和 microtask（微任务）两类。关于事件循环的权威定义可以在 HTML 规范文档中查到：https://html.spec.whatwg.org/multipage/webappapis.html#event-loops。
+
+当满足执行条件时，task 和 microtask 会被放入各自的队列中，等待进入主线程执行，这两个队列被称为 task queue（或 macrotask queue）和 microtask queue。
+
+- task：包括 script 中的代码、`setTimeout`、`setInterval`、`I/O`、UI render
+- microtask：包括 `promise`、`Object.observe`、`MutationObserver`
+
+不过，正如规范强调的，这里的 task queue 并非是队列，而是集合（sets），因为事件循环的执行规则是执行第一个可执行的任务，而不是将第一个任务出队并执行。
+
+详细的执行规则可以在 https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model 查询，一共有 15 个步骤。
+
+可以将执行步骤不严谨的归纳为：
+
+1. 执行完主线程中的任务
+2. 清空 microtask queue 中的任务并执行完毕
+3. 取出 macrotask queue 中的一个任务执行
+4. 清空 microtask queue 中的任务并执行完毕
+5. 重复 3、4
+
+进一步归纳，就是：一个宏任务，所有微任务；一个宏任务，所有微任务...
+
+### Node 环境
+
+Node 中的事件循环流程已经在前面详述（参见_事件循环的执行机制_一节），这里就不再赘述了。一图以蔽之：
+
+![image](https://user-images.githubusercontent.com/9818716/61017139-b1001180-a3c4-11e9-8860-1c5e54d6ce5c.png)
+
+下面，让我们看一些容易产生误解的情况：
+
+#### `process.nextTick` 造成的 *starve* 现象
+
+```javascript
+const fs = require('fs');
+
+function addNextTickRecurs(count) {
+  let self = this;
+  if (self.id === undefined) {
+    self.id = 0;
+  }
+
+  if (self.id === count) return;
+
+  process.nextTick(() => {
+    console.log(`process.nextTick call ${++self.id}`);
+    addNextTickRecurs.call(self, count);
+  });
+}
+
+addNextTickRecurs(Infinity);
+setTimeout(console.log.bind(console, 'omg! setTimeout was called'), 10);
+setImmediate(console.log.bind(console, 'omg! setImmediate also was called'));
+fs.readFile(__filename, () => {
+  console.log('omg! file read complete callback was called!');
+});
+
+console.log('started');
+```
+
+在这段代码中，由于递归调用了 `process.nextTick`，`setTimeout`、`setImmediate` 以及文件 I/O 的回调将永远不会得到执行。因为执行 libuv 中七个阶段前，会清空 microtask 中的任务。所谓的清空是指，执行完 microtask 队列中已有的任务之后，准备执行 libuv 中的任务之前，会再次确认 microtask 中的任务是否为空，若还有任务，会继续执行。由于递归调用了 `process.nextTick`，会不断往 microtask 中添加任务，从而造成了这种其他队列的饥饿（starve）现象。
+
+当然，在 Node v0.12 之前，存在 `process.maxTickDepth` 属性，用于限制 `process.nextTick` 的执行深度。但是在 v0.12 之后，出于某些原因，这个属性被移除了。此后只能建议开发者避免写出这种代码。
+
+执行结果为：
+
+```
+started
+process.nextTick call 1
+process.nextTick call 2
+process.nextTick call 3
+...
+```
+
+#### `setTimeout` vs `setImmediate`
+
+`setTimeout` 和 `setImmediate` 的回调哪个会先执行呢？有同学可能会说，我知道啊，`setTimeout` 属于 timers 阶段，`setImmediate` 属于 check 阶段，所以会先执行 `setTimeout`。错~，正确答案是，我们无法保证它们的先后顺序。
+
+```javascript
+setTimeout(function() {
+  console.log('setTimeout')
+}, 0);
+setImmediate(function() {
+  console.log('setImmediate')
+});
+```
+
+多次执行这段代码，可以看到，我们会得到两种不同的输出结果。
+
+这是由 `setTimeout` 的执行特性导致的，`setTimeout` 中的回调会在超时时间后被执行，但是具体的执行时间却不是确定的，即使设置的超时时间为 0。所以，当事件循环启动时，定时任务可能尚未进入队列，于是，`setTimeout` 被跳过，转而执行了 check 阶段的任务。
+
+换句话说，这种情况下，`setTimeou` 和 `setImmediate` 不一定处于同一个循环内，所以它们的执行顺序是不确定的。
+
+事情到这里并没有结束：
+
+```javascript
+const fs = require('fs');
+
+fs.readFile(__filename, () => {
+    setTimeout(() => {
+        console.log('timeout')
+    }, 0);
+    setImmediate(() => {
+        console.log('immediate')
+    })
+});
+```
+
+对于这种情况，immediate 将会永远先于 timeout 输出。
+
+让我们捋一遍这段代码的执行过程：
+
+1. 执行 `fs.readFile`，开始文件 I/O
+2. 事件循环启动
+3. 文件读取完毕，相应的回调会被加入事件循环中的 I/O 队列
+4. 事件循环执行到 pending 阶段，执行 I/O 队列中的任务
+5. 回调函数执行过程中，定时器被加入 timers 最小堆中，`setImmediate` 的回调被加入 immediates 队列中
+6. 当前事件循环处于 pending 阶段，接下来会继续执行，到达 check 阶段。这是，发现 immediates 队列中存在任务，从而执行 `setImmediate` 注册的回调函数
+7. 本轮事件循环执行完毕，进入下一轮，在 timers 阶段执行 `setTimeout` 注册的回调函数
+
+#### `promise` vs `process.nextTick`
+
+`promise` 和 `process.nextTick` 组合使用的情况比较好理解，`nextTick` 会优于 `promise` 执行，microtask 会优于 7 个阶段执行，在执行 7 个阶段前，会进一步确认 microtask 队列是否为空。例如：
+
+```javascript
+Promise.resolve().then(() => console.log('promise1 resolved'));
+Promise.resolve().then(() => console.log('promise2 resolved'));
+Promise.resolve().then(() => {
+    console.log('promise3 resolved');
+    process.nextTick(() => console.log('next tick inside promise resolve handler'));
+});
+Promise.resolve().then(() => console.log('promise4 resolved'));
+Promise.resolve().then(() => console.log('promise5 resolved'));
+setImmediate(() => console.log('set immediate1'));
+setImmediate(() => console.log('set immediate2'));
+
+process.nextTick(() => console.log('next tick1'));
+process.nextTick(() => console.log('next tick2'));
+process.nextTick(() => console.log('next tick3'));
+
+setTimeout(() => console.log('set timeout'), 0);
+setImmediate(() => console.log('set immediate3'));
+setImmediate(() => console.log('set immediate4'));
+```
+
+执行结果将为：
+
+```
+next tick1
+next tick2
+next tick3
+promise1 resolved
+promise2 resolved
+promise3 resolved
+promise4 resolved
+promise5 resolved
+next tick inside promise resolve handler
+set timeout
+set immediate1
+set immediate2
+set immediate3
+set immediate4
+```
+
+## 总结
+
+本文介绍了 Node 中事件循环的作用、执行机制以及与浏览器中事件循环的区别。事件循环是事件驱动编程模式的基础，通过事件驱动模式，可以构建异步非阻塞的高性能服务器，非常适合 I/O 密集型 web 应用。在 Node 中，事件循环是由 libuv 实现的，`uv_run()` 函数中定义了事件循环的七个阶段。在 HTML 规范中，同样也对事件循环做了定义，并由各个浏览器厂商各自实现，实现原理和运行机制都与 Node 中的事件循环有一定的区别。同时，由于 Node 是在不断迭代的，目前最新已经到了 v12.6.0 版本，不同版本间也会存在一定差异，所以本文也无法涵盖关于事件循环的所有内容。当我们讨论关于事件循环的具体问题时，可能会发现许多与之前经验不符的现象。对于这些问题，首先要确定 Node 版本；然后，多动手实验、多看源码、多读规范，形成自己的正确认识。
